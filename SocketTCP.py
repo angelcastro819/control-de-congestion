@@ -5,6 +5,7 @@ import random
 import os
 import time
 import sys
+from CongestionControl import CongestionControl
 
 DEBUG = os.environ.get("TCP_DEBUG") == "1"
 LOSS_RATE = float(os.environ.get("TCP_LOSS", "0"))
@@ -42,6 +43,9 @@ class SocketTCP:
         self.recv_buffer = b""
         self.remaining_bytes = 0
         self.fin_seq = None
+        self.congestion_control_on = os.environ.get("TCP_CC", "1") == "1"
+        self.congestion_controler = None
+        self.number_of_sent_segments = 0
 
     @staticmethod
     def create_segment(segment):
@@ -193,80 +197,212 @@ class SocketTCP:
             return self.recv_using_go_back_n(buff_size)
         raise ValueError(f"modo desconocido: {mode}")
 
-    def _gbn_send_slots(self, sock, data_window, first_index):
-        # envía los elementos de la ventana desde first_index (el timer 0 parte solo si no estaba corriendo)
-        for i in range(first_index, data_window.window_size):
+    def set_congestion_control(self, enabled):
+        """Activa o desactiva el control para los próximos envíos."""
+        if not isinstance(enabled, bool):
+            raise TypeError("enabled debe ser bool")
+
+        self.congestion_control_on = enabled
+
+    def _gbn_debug_window(self, event, data_window):
+        cc = self.congestion_controler
+
+        debug(
+            f"GBN: {event}, "
+            f"cc={self.congestion_control_on}, "
+            f"estado={cc.current_state}, "
+            f"cwnd={cc.get_cwnd():.3f} bytes, "
+            f"ssthresh={cc.get_ssthresh()}, "
+            f"window_size={data_window.window_size}, "
+            f"base={data_window.get_sequence_number(0)}"
+        )
+
+    def _gbn_send_slots(
+        self, sock, data_window, sent_sequences,
+        sent_ends, retransmit=False
+    ):
+        for i in range(data_window.window_size):
             data = data_window.get_data(i)
+
             if data is None:
                 break
-            segment = self.create_segment({"ack": False, "syn": False, "fin": False,
-                                           "seq": data_window.get_sequence_number(i),
-                                           "data": data})
+
+            seq = data_window.get_sequence_number(i)
+
+            # En un envío normal omitimos los segmentos ya enviados.
+            # Ante timeout los retransmitimos.
+            if seq in sent_sequences and not retransmit:
+                continue
+
+            segment = self.create_segment({
+                "ack": False,
+                "syn": False,
+                "fin": False,
+                "seq": seq,
+                "data": data
+            })
+
             sock.sendto(segment, self.dest_address, 0)
 
+            self.number_of_sent_segments += 1
+            sent_sequences.add(seq)
+            sent_ends.add(seq + len(data))
+
     def send_using_go_back_n(self, message):
-        # primer trozo: largo del mensaje, luego el mensaje en trozos de chunk_size
+        self.congestion_controler = CongestionControl(MSS=8)
+        congestion_controler = self.congestion_controler
+        self.number_of_sent_segments = 0
+
+        # Primero enviamos el largo; luego el mensaje en trozos de 8 bytes.
         data_list = [len(message).to_bytes(4, byteorder="big")]
-        for i in range(0, len(message), self.chunk_size):
-            data_list.append(message[i:i + self.chunk_size])
-        end_seq = self.seq_num + sum(len(d) for d in data_list)
 
-        data_window = SlidingWindowCC(self.window_size, data_list, self.seq_num)
+        for i in range(0, len(message), 8):
+            data_list.append(message[i:i + 8])
 
-        # SocketUDP sobre NUESTRO socket UDP (mismo puerto) con pérdida simulada
+        end_seq = self.seq_num + sum(len(data) for data in data_list)
+
+        if self.congestion_control_on:
+            window_size = congestion_controler.get_MSS_in_cwnd()
+        else:
+            window_size = self.window_size
+
+        data_window = SlidingWindowCC(
+            window_size, data_list, self.seq_num
+        )
+
+        # Conservamos estos registros aunque la ventana disminuya.
+        sent_sequences = set()
+        sent_ends = set()
+
         sock = SocketUDP()
         sock.socket_udp.close()
         sock.socket_udp = _LossySocket(self.udp_socket)
         sock.settimeout(self.timeout)
 
         previous_timeout = self.udp_socket.gettimeout()
-        self.udp_socket.setblocking(False) # SocketUDP maneja los timers
+        self.udp_socket.setblocking(False)
+
         try:
-            self._gbn_send_slots(sock, data_window, 0)
+            self._gbn_debug_window("inicio", data_window)
+
+            self._gbn_send_slots(
+                sock, data_window, sent_sequences, sent_ends
+            )
 
             while data_window.get_data(0) is not None:
                 try:
                     ack_bytes, sender_address = sock.recvfrom(23)
+
                 except TimeoutError:
-                    # timeout, reenviamos toda la ventana
-                    debug(f"GBN: timeout, reenvío ventana desde seq={data_window.get_sequence_number(0)}")
                     sock.stop_timer(0)
-                    self._gbn_send_slots(sock, data_window, 0)
+
+                    if self.congestion_control_on:
+                        congestion_controler.event_timeout()
+
+                        window_size = (
+                            congestion_controler.get_MSS_in_cwnd()
+                        )
+
+                        data_window.update_window_size(window_size)
+
+                    self._gbn_debug_window("timeout", data_window)
+
+                    self._gbn_send_slots(
+                        sock,
+                        data_window,
+                        sent_sequences,
+                        sent_ends,
+                        retransmit=True
+                    )
+
                     continue
 
                 if sender_address != self.dest_address:
                     continue
+
                 try:
                     ack = self.parse_segment(ack_bytes)
                 except ValueError:
                     continue
-                if not ack["ack"] or ack["syn"] or ack["fin"] or ack["data"] != b"":
+
+                if (
+                    not ack["ack"]
+                    or ack["syn"]
+                    or ack["fin"]
+                    or ack["data"] != b""
+                ):
                     continue
 
-                # ACK acumulativo, cuántos elementos de la ventana confirma
-                acked = 0
-                for i in range(data_window.window_size):
-                    data = data_window.get_data(i)
-                    if data is None:
-                        break
-                    if data_window.get_sequence_number(i) + len(data) == ack["seq"]:
-                        acked = i + 1
-                        break
-                if acked == 0:
-                    continue  # ACK viejo/duplicado
+                ack_seq = ack["seq"]
 
-                debug(f"GBN: ACK seq={ack['seq']}, confirma {acked} segmentos")
-                data_window.move_window(acked)
-                first_new = data_window.window_size - acked
+                # Ignoramos ACK viejos, duplicados o que no correspondan
+                # al final de algún segmento ya enviado.
+                if (
+                    ack_seq <= data_window.get_sequence_number(0)
+                    or ack_seq not in sent_ends
+                ):
+                    continue
+
+                # El ACK puede superar la ventana actual después de
+                # una reducción. Avanzamos tantas veces como haga falta.
+                while data_window.get_data(0) is not None:
+                    acked = 0
+
+                    for i in range(data_window.window_size):
+                        data = data_window.get_data(i)
+
+                        if data is None:
+                            break
+
+                        segment_end = (
+                            data_window.get_sequence_number(i) + len(data)
+                        )
+
+                        if segment_end <= ack_seq:
+                            acked += 1
+                        else:
+                            break
+
+                    if acked == 0:
+                        break
+
+                    data_window.move_window(acked)
+
+                if self.congestion_control_on:
+                    # Un evento por ACK nuevo, aunque sea acumulativo.
+                    congestion_controler.event_ack_received()
+
+                    window_size = (
+                        congestion_controler.get_MSS_in_cwnd()
+                    )
+
+                    data_window.update_window_size(window_size)
+
+                self._gbn_debug_window(
+                    f"ACK seq={ack_seq}", data_window
+                )
+
                 if data_window.get_data(0) is None:
-                    break # todo confirmado
-                if data_window.get_data(first_new) is not None:
-                    # reiniciamos el timer y enviamos los nuevos
+                    break
+
+                # Si todos los envíos anteriores fueron confirmados,
+                # el próximo envío debe iniciar un timer nuevo.
+                outstanding_old = any(
+                    seq >= ack_seq for seq in sent_sequences
+                )
+
+                if not outstanding_old:
                     sock.stop_timer(0)
-                    self._gbn_send_slots(sock, data_window, first_new)
+
+                # Envía consecutivamente los nuevos elementos.
+                self._gbn_send_slots(
+                    sock, data_window, sent_sequences, sent_ends
+                )
+
         finally:
             if sock.timer_list[0] is not None:
                 sock.stop_timer(0)
+
             self.udp_socket.settimeout(previous_timeout)
 
         self.seq_num = end_seq
